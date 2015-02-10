@@ -1,2 +1,2 @@
 #!/bin/bash
-yum install haproxy
+yum install -y haproxy
