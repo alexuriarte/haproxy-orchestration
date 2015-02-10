@@ -5,6 +5,10 @@ import json
 import shutil
 import subprocess
 import StringIO
+import logging
+
+
+logger = logging.getLogger("haproxy")
 
 # This script re-creates a HAproxy configuration, and reloads HAproxy
 # accordingly.
@@ -26,6 +30,7 @@ import StringIO
 #  }
 # ]
 
+CONFIG_ENVIRON = "HAPROXY_CONFIGURATION"
 HAPROXY_CONFIGURATION_FILE = "/etc/haproxy/haproxy.cfg"
 
 BASE_CONFIGURATION = """
@@ -41,6 +46,7 @@ defaults
   mode http
   option httplog
   option dontlognull
+  option forwardfor
   contimeout 5000
   clitimeout 50000
   srvtimeout 50000
@@ -55,29 +61,39 @@ defaults
 
 
 def main():
-    config = os.environ.get("HAPROXY_CONFIGURATION")
+    config = os.environ.get(CONFIG_ENVIRON)
 
     if config is None:
-        raise Exception("No HAproxy configuration!")
+        logger.error("No HAproxy configuration in the environment; provide one in %s", CONFIG_ENVIRON)
+        sys.exit(-1)
 
-    config = json.loads(config)
+    try:
+        config = json.loads(config)
+    except ValueError:
+        logger.exception("HAproxy configuration is invalid")
+        sys.exit(-1)
 
-    # Resulting configuration file
+    # Stream for the resulting configuration file
     s = StringIO.StringIO()
     s.write(BASE_CONFIGURATION)
     s.write("\n")
 
+    # Whether we found anything to do.
     must_reload = False
 
-    print "Loading from queryenv"
+    # Load the rest of the Farm from queryenv
+    logger.info("Loading Farm from queryenv")
+
     p = subprocess.Popen(["szradm", "queryenv", "--format=json", "list-roles"], stdout=subprocess.PIPE)
     out, err = p.communicate()
     if p.returncode:
-        raise Exception("Failed to get servers from szradm: {0}".format(stderr))
+        logger.exception("Got a error from szradm: %s", stderr)
+        sys.exit(1)
     queryenv = json.loads(out)
 
     for proxy_config in config:
-        print "Processing: {0}".format(proxy_config["name"])
+        logger.info("Processing: %s", proxy_config["name"])
+        proxy_logger = logging.getLogger("haproxy.{0}".format(proxy_config["name"]))
 
         # Start with getting a list of servers to proxy to.
         alias = proxy_config["upstream"]["alias"]
@@ -87,15 +103,17 @@ def main():
 
         # Check we have a Farm Role that matches the configuration
         if not upstream_role:
-            print "No role for: {0}".format(proxy_config["upstream"]["alias"])
+            proxy_logger.warning("Upstream Farm Role '%s' was not found", proxy_config["upstream"]["alias"])
             continue
         upstream_role, = upstream_role
+        proxy_logger.debug("Found upstream Farm Role '%s': #%s", upstream_role["alias"], upstream_role["id"])
 
         # Check we have some Servers in running state in that Farm Role
         servers = [server for server in upstream_role["hosts"] if server["status"] == "Running"]
         if not servers:
-            print "No running upstream servers for: {0}".format(proxy_config["upstream"]["alias"])
+            proxy_logger.warning("No running upstream server found")
             continue
+        proxy_logger.debug("Found %s running upstream servers", len(servers))
 
         # All good, create the configuration
 
@@ -107,13 +125,14 @@ def main():
         # Backend
         s.write("backend {0}-out\n".format(proxy_config["name"]))
         for server in servers:
+            proxy_logger.debug("Adding upstream server: %s", server["internal-ip"])
             s.write("  server {0}-{1} {2}:{3}\n".format(proxy_config["name"], server["index"], server["internal-ip"], proxy_config["upstream"]["port"]))
 
         must_reload = True
 
     if not must_reload:
-        print "Nothing to do, exiting."
-        return
+        logger.info("Nothing to do, exiting")
+        sys.exit(0)
 
     # Note: consider making a backup first
     s.seek(0)
@@ -121,14 +140,17 @@ def main():
         shutil.copyfileobj(s, f)
 
     # Check configuration
+    logger.info("Checking generated haproxy configuration is valid")
     subprocess.check_call(["haproxy", "-f", HAPROXY_CONFIGURATION_FILE, "-c"])
 
     # Identify whether Haproxy should be started or reloaded
+    logger.info("Reloading haproxy")
     cmd = "reload" if subprocess.call(["service", "haproxy", "status"]) == 0 else "start"
 
-    print "Reloading haproxy with: {0}".format(cmd)
+    logger.debug("Reloading with command: %s", cmd)
     subprocess.check_call(["service", "haproxy", cmd])
 
 if __name__ == "__main__":
+    logging.basicConfig(format="[%(asctime)s: %(levelname)s/%(name)s] %(message)s", level=logging.DEBUG)
     main()
 
